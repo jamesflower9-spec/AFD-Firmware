@@ -49,8 +49,19 @@
 #define AOA_MIN_DEG      -20.0f
 #define AOA_MAX_DEG       20.0f
 
-/* ---- Step rate ---- */
-#define STEP_RATE_HZ     2000u
+/* ---- Motion profile -------------------------------------------------------
+ * Trapezoidal: start slow, accelerate to cruise, decelerate before arrival.
+ * A NEMA 34 rotor going from rest to full rate in one step puts a shock
+ * through the worm teeth, and the closed-loop driver has to work hard to
+ * catch up. Ramping removes both problems and lets the cruise rate be much
+ * higher than a fixed rate could safely be.
+ *
+ * At 5 kHz, 1600 pulses/rev and 80:1, the airfoil moves 14 deg/s, so a full
+ * -20 to +20 sweep takes under three seconds.
+ */
+#define START_RATE_HZ    500u
+#define MAX_RATE_HZ      5000u
+#define RAMP_STEPS       800u       /* steps spent accelerating */
 
 /* ---- Status stream period ---- */
 #define STATUS_MS        100u
@@ -77,13 +88,28 @@
  */
 #define MUX_CHANNELS     16u
 #define TAPS_PER_MUX     12u
-
-/* Settling allowance after changing the address, in microseconds. The mux
- * switches in well under a microsecond; what actually sets this number is
- * the ADC input capacitor charging through the mux on-resistance plus the
- * sensor divider.
- */
 #define MUX_SETTLE_US    10u
+
+/* ---- Position storage -----------------------------------------------------
+ * The worm is self-locking, so the airfoil cannot move while the motor is
+ * off. That means the angle at power-down is still the angle at power-up,
+ * and storing the step count is enough to survive a power cycle without any
+ * homing hardware.
+ *
+ * Sector 7 of the F411RE is 128 KB at 0x08060000, well clear of the program.
+ *
+ * Records are appended rather than overwriting one location. Flash bits can
+ * go 1 -> 0 without an erase, so a fresh record can be written into the next
+ * blank slot; only when the sector fills does it need erasing. Erasing on
+ * every save would wear the sector out after about ten thousand moves, which
+ * is roughly 250 sweeps - reachable within a year of class use. Appending
+ * pushes that out by four orders of magnitude.
+ */
+#define STORE_BASE       0x08060000UL
+#define STORE_SECTOR     FLASH_SECTOR_7
+#define STORE_SIZE       (128u * 1024u)
+#define STORE_MAGIC      0xA5F00FA5UL
+#define STORE_SLOTS      (STORE_SIZE / 8u)
 
 /* USER CODE END PD */
 
@@ -101,9 +127,12 @@ UART_HandleTypeDef huart2;
 
 /* USER CODE BEGIN PV */
 /* Motor state, shared with the TIM1 interrupt */
-static volatile int32_t pos_steps  = 0;
-static volatile int32_t steps_left = 0;
-static volatile int8_t  step_dir   = 0;
+static volatile int32_t  pos_steps   = 0;
+static volatile uint32_t steps_left  = 0;
+static volatile uint32_t steps_total = 0;
+static volatile uint32_t steps_done  = 0;
+static volatile int8_t   step_dir    = 0;
+static volatile uint8_t  save_due    = 0;   /* set by ISR, acted on in main */
 
 /* Serial receive, shared with the UART interrupt */
 static uint8_t          rx_byte;
@@ -119,6 +148,9 @@ static uint16_t raw[MUX_CHANNELS * 2];
 
 /* Set by the 'R' command: stream all 32 channels instead of the 24 taps */
 static uint8_t raw_mode = 0;
+
+/* Last value written to flash, so unchanged positions are not rewritten */
+static int32_t saved_pos = 0;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -128,40 +160,116 @@ static void MX_USART2_UART_Init(void);
 static void MX_TIM1_Init(void);
 static void MX_ADC1_Init(void);
 /* USER CODE BEGIN PFP */
-static void  motor_init(void);
-static void  motor_set_rate(uint32_t hz);
-static int   motor_move_to(float deg);
-static void  motor_stop(void);
-static int   motor_busy(void);
-static float motor_angle(void);
-static void  delay_us(uint32_t us);
-static void  mux_select(uint8_t ch);
-static void  scan_all(void);
-static void  uart_send(const char *s);
-static void  send_status(void);
-static void  handle_line(char *line);
+static void     motor_init(void);
+static void     motor_apply_rate(uint32_t hz);
+static uint32_t rate_for_step(uint32_t done, uint32_t total);
+static int      motor_move_to(float deg);
+static void     motor_stop(void);
+static int      motor_busy(void);
+static float    motor_angle(void);
+static void     delay_us(uint32_t us);
+static void     mux_select(uint8_t ch);
+static void     scan_all(void);
+static int32_t  store_load(void);
+static void     store_save(int32_t value);
+static void     uart_send(const char *s);
+static void     send_status(void);
+static void     handle_line(char *line);
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
+
+/* ---- Position storage ----------------------------------------------------*/
+
+/* Walk the sector and return the last valid record, or 0 if there is none. */
+static int32_t store_load(void)
+{
+  const uint32_t *p = (const uint32_t *)STORE_BASE;
+  int32_t found = 0;
+
+  for (uint32_t i = 0; i < STORE_SLOTS; i++)
+  {
+    if (p[i * 2] != STORE_MAGIC) break;      /* first blank slot ends it */
+    found = (int32_t)p[i * 2 + 1];
+  }
+  return found;
+}
+
+/* Append a record. Erases and restarts when the sector is full. */
+static void store_save(int32_t value)
+{
+  const uint32_t *p = (const uint32_t *)STORE_BASE;
+
+  uint32_t slot = 0;
+  while (slot < STORE_SLOTS && p[slot * 2] == STORE_MAGIC) slot++;
+
+  HAL_FLASH_Unlock();
+
+  if (slot >= STORE_SLOTS)
+  {
+    FLASH_EraseInitTypeDef er = {0};
+    uint32_t err = 0;
+    er.TypeErase    = FLASH_TYPEERASE_SECTORS;
+    er.Sector       = STORE_SECTOR;
+    er.NbSectors    = 1;
+    er.VoltageRange = FLASH_VOLTAGE_RANGE_3;
+    HAL_FLASHEx_Erase(&er, &err);
+    slot = 0;
+  }
+
+  uint32_t addr = STORE_BASE + slot * 8u;
+
+  /* Value first, then magic. If power is lost between the two writes the
+   * record has no magic and is simply ignored on the next boot, leaving the
+   * previous record as the newest valid one.
+   */
+  HAL_FLASH_Program(FLASH_TYPEPROGRAM_WORD, addr + 4u, (uint32_t)value);
+  HAL_FLASH_Program(FLASH_TYPEPROGRAM_WORD, addr, STORE_MAGIC);
+
+  HAL_FLASH_Lock();
+  saved_pos = value;
+}
 
 /* ---- Motor ---------------------------------------------------------------*/
 
 static void motor_init(void)
 {
   __HAL_TIM_SET_PRESCALER(&htim1, 83);          /* 84 MHz -> 1 MHz tick */
-  motor_set_rate(STEP_RATE_HZ);
+  motor_apply_rate(START_RATE_HZ);
   __HAL_TIM_ENABLE_IT(&htim1, TIM_IT_UPDATE);
 
   HAL_GPIO_WritePin(ENA_GPIO_Port, ENA_Pin, MOTOR_HOLD);
   HAL_GPIO_WritePin(DIR_GPIO_Port, DIR_Pin, DIR_POSITIVE);
 }
 
-static void motor_set_rate(uint32_t hz)
+/* With auto-reload preload enabled these take effect at the next update
+ * event, so the pulse currently in flight is never truncated.
+ */
+static void motor_apply_rate(uint32_t hz)
 {
   uint32_t arr = (1000000u / hz) - 1u;
   __HAL_TIM_SET_AUTORELOAD(&htim1, arr);
   __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_1, (arr + 1u) / 2u);
+}
+
+/* Trapezoidal profile. Ramp length is halved for short moves so the
+ * acceleration and deceleration phases never overlap.
+ */
+static uint32_t rate_for_step(uint32_t done, uint32_t total)
+{
+  uint32_t ramp = RAMP_STEPS;
+  if (ramp > total / 2u) ramp = total / 2u;
+  if (ramp == 0u) return START_RATE_HZ;     /* move too short to ramp */
+
+  uint32_t remaining = total - done;
+  uint32_t phase;
+
+  if (done < ramp)            phase = done;         /* accelerating */
+  else if (remaining <= ramp) phase = remaining;    /* decelerating */
+  else                        return MAX_RATE_HZ;   /* cruising     */
+
+  return START_RATE_HZ + (MAX_RATE_HZ - START_RATE_HZ) * phase / ramp;
 }
 
 /* Absolute move, non-blocking. Returns 0 on success, -1 if already moving.
@@ -185,8 +293,11 @@ static int motor_move_to(float deg)
 
   for (volatile int i = 0; i < 500; i++) { __NOP(); }  /* DIR setup time */
 
-  steps_left = (delta > 0) ? delta : -delta;
+  steps_total = (uint32_t)((delta > 0) ? delta : -delta);
+  steps_done  = 0;
+  steps_left  = steps_total;
 
+  motor_apply_rate(START_RATE_HZ);
   __HAL_TIM_SET_COUNTER(&htim1, 0);
   HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_1);
   return 0;
@@ -196,6 +307,7 @@ static void motor_stop(void)
 {
   HAL_TIM_PWM_Stop(&htim1, TIM_CHANNEL_1);
   steps_left = 0;
+  save_due = 1;
 }
 
 static int motor_busy(void)
@@ -208,18 +320,26 @@ static float motor_angle(void)
   return (float)pos_steps / STEPS_PER_DEG;
 }
 
-/* One step per timer update */
+/* One step per timer update. The rate for the next step is computed here,
+ * which is what produces the ramp.
+ */
 void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
 {
   if (htim->Instance != TIM1) return;
+  if (steps_left == 0) return;
 
-  if (steps_left > 0)
+  pos_steps += step_dir;
+  steps_done++;
+  steps_left--;
+
+  if (steps_left == 0)
   {
-    pos_steps += step_dir;
-    if (--steps_left == 0)
-    {
-      HAL_TIM_PWM_Stop(&htim1, TIM_CHANNEL_1);
-    }
+    HAL_TIM_PWM_Stop(&htim1, TIM_CHANNEL_1);
+    save_due = 1;                 /* flash write happens in the main loop */
+  }
+  else
+  {
+    motor_apply_rate(rate_for_step(steps_done, steps_total));
   }
 }
 
@@ -314,9 +434,8 @@ void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
  *   normal:  S,<angle>,<moving>,<t1>..<t24>      the 24 tap channels
  *   raw:     S,<angle>,<moving>,<c0>..<c31>      every channel, both muxes
  *
- * Raw mode is for bench testing, where you want to see the spare channels
- * too. Values are raw ADC counts, 0 to 4095; converting to pressure happens
- * on the PC so the calibration can be changed without reflashing.
+ * Values are raw ADC counts, 0 to 4095. Converting to pressure happens on
+ * the PC so the calibration can change without reflashing.
  */
 static void send_status(void)
 {
@@ -344,7 +463,7 @@ static void send_status(void)
 /* ---- Command set ----------------------------------------------------------
  *  A<angle>   absolute move, e.g. A12.5 or A-7.25
  *  X          stop immediately
- *  Z          set current position as zero
+ *  Z          set current position as zero, and store it
  *  R          toggle raw channel streaming (32 values instead of 24)
  *  ?          identify
  */
@@ -378,6 +497,7 @@ static void handle_line(char *line)
     else
     {
       pos_steps = 0;
+      store_save(0);
       uart_send("OK\r\n");
     }
   }
@@ -388,7 +508,7 @@ static void handle_line(char *line)
   }
   else if (cmd == '?')
   {
-    uart_send("AFD,1.1\r\n");
+    uart_send("AFD,1.2\r\n");
   }
   else
   {
@@ -432,9 +552,16 @@ int main(void)
   MX_ADC1_Init();
   /* USER CODE BEGIN 2 */
 
-  motor_init();                              /* current position becomes 0  */
-  HAL_UART_Receive_IT(&huart2, &rx_byte, 1); /* start listening             */
-  uart_send("AFD,1.1\r\n");
+  motor_init();
+
+  /* Pick up where the last session left off. The self-locking worm means the
+   * airfoil cannot have moved while the power was off.
+   */
+  pos_steps = store_load();
+  saved_pos = pos_steps;
+
+  HAL_UART_Receive_IT(&huart2, &rx_byte, 1);
+  uart_send("AFD,1.2\r\n");
 
   uint32_t t_status = HAL_GetTick();
 
@@ -449,6 +576,16 @@ int main(void)
     /* USER CODE BEGIN 3 */
 
     scan_all();          /* a few hundred microseconds, runs continuously */
+
+    /* Flash writes stall the CPU while they complete, which would delay the
+     * step interrupt. Doing them here rather than in the ISR means they only
+     * ever happen with the motor stationary.
+     */
+    if (save_due)
+    {
+      save_due = 0;
+      if (pos_steps != saved_pos) store_save(pos_steps);
+    }
 
     if (line_ready)
     {
@@ -601,7 +738,7 @@ static void MX_TIM1_Init(void)
   htim1.Init.Period = 999;
   htim1.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
   htim1.Init.RepetitionCounter = 0;
-  htim1.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
+  htim1.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_ENABLE;
   if (HAL_TIM_Base_Init(&htim1) != HAL_OK)
   {
     Error_Handler();
